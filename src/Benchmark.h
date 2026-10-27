@@ -36,7 +36,9 @@ namespace probe
 /** One benchmark configuration. */
 struct Scenario {
     std::string name;
-    std::uint32_t drawCount;   ///< meshes per frame (48 triangles each)
+    std::uint32_t drawCount;   ///< meshes drawn per frame (48 triangles each)
+    std::uint32_t uploadDraws; ///< meshes whose vertex data is re-uploaded per frame
+    bool perDrawImmediates;    ///< set immediates before every draw (as Aurora does) or once
     std::uint32_t efbWidth;    ///< internal render resolution
     std::uint32_t efbHeight;
 };
@@ -82,8 +84,27 @@ private:
     Efb &GetEfb(std::uint32_t width, std::uint32_t height);
     void UploadOverlay(const TextImage &overlay);
 
-    /** Records and submits one frame; @return False if no screen texture was available. */
-    bool RenderFrame(const wgpu::RenderPipeline &drawPipeline, Efb &efb, std::uint32_t drawCount);
+    /** What one frame does (see Scenario). */
+    struct FrameWork {
+        std::uint32_t drawCount   = 0;
+        std::uint32_t uploadDraws = 0;
+        bool perDrawImmediates    = true;
+    };
+
+    /** CPU time spent in each step of the measured frames, in ms. */
+    struct FrameTimings {
+        double upload  = 0.0; ///< WriteTexture / WriteBuffer of the vertex data
+        double record  = 0.0; ///< command encoding in Dawn
+        double submit  = 0.0; ///< Queue::Submit: Dawn's GL backend makes the GL calls here
+        double present = 0.0; ///< Surface::Present: eglSwapBuffers, may wait for the GPU
+    };
+
+    /**
+     * Records and submits one frame; adds the time of each step to @p timings if given.
+     * @return False if no screen texture was available.
+     */
+    bool RenderFrame(const wgpu::RenderPipeline &drawPipeline, Efb &efb, const FrameWork &work,
+                     FrameTimings *timings = nullptr);
 
     GpuContext *context_ = nullptr;
     wgpu::Device device_;

@@ -636,13 +636,23 @@ void Benchmark::UploadOverlay(const TextImage &overlay)
     context_->Queue().WriteTexture(&destination, overlay.Pixels().data(), overlay.Pixels().size(), &layout, &extent);
 }
 
-bool Benchmark::RenderFrame(const wgpu::RenderPipeline &drawPipeline, Efb &efb, std::uint32_t drawCount)
+bool Benchmark::RenderFrame(const wgpu::RenderPipeline &drawPipeline, Efb &efb, const FrameWork &work,
+                            FrameTimings *timings)
 {
-    const wgpu::Queue &queue = context_->Queue();
+    const wgpu::Queue &queue    = context_->Queue();
+    const std::uint32_t drawCount = work.drawCount;
+    double mark                 = NowMs();
+    // Adds the time since the last mark to one of the timing buckets.
+    auto lap = [&mark, timings](double FrameTimings::*bucket) {
+        const double now = NowMs();
+        if (timings)
+            timings->*bucket += now - mark;
+        mark = now;
+    };
 
     // 1. Stream this frame's vertices, as Aurora does with the game's vertex data.
-    if (drawCount > 0) {
-        const std::size_t bytes = static_cast<std::size_t>(drawCount) * kVerticesPerMesh * kBytesPerVertex;
+    if (work.uploadDraws > 0) {
+        const std::size_t bytes = static_cast<std::size_t>(work.uploadDraws) * kVerticesPerMesh * kBytesPerVertex;
         if (useTextures_) {
             const std::size_t rowBytes = static_cast<std::size_t>(kDataTextureWidth) * 4;
             WriteDataTexture(vertexTexture_, vertexWords_.data(), static_cast<std::uint32_t>((bytes + rowBytes - 1) / rowBytes));
@@ -650,6 +660,7 @@ bool Benchmark::RenderFrame(const wgpu::RenderPipeline &drawPipeline, Efb &efb, 
             queue.WriteBuffer(vertexBuffer_, 0, vertexWords_.data(), bytes);
         }
     }
+    lap(&FrameTimings::upload);
 
     const wgpu::CommandEncoder encoder = device_.CreateCommandEncoder();
 
@@ -677,11 +688,18 @@ bool Benchmark::RenderFrame(const wgpu::RenderPipeline &drawPipeline, Efb &efb, 
             encoderPass.SetBindGroup(1, uniformGroup_);
             encoderPass.SetBindGroup(2, textureGroup_);
             DrawImmediates immediates = {};
-            for (std::uint32_t i = 0; i < drawCount; ++i) {
-                immediates.vtxStart     = i * kVerticesPerMesh;
-                immediates.currentPnMtx = (i * 37u) % kMatrixCount;
+            if (!work.perDrawImmediates)
                 encoderPass.SetImmediates(0, &immediates, sizeof(immediates));
-                encoderPass.Draw(kVerticesPerMesh);
+            for (std::uint32_t i = 0; i < drawCount; ++i) {
+                if (work.perDrawImmediates) {
+                    immediates.vtxStart     = i * kVerticesPerMesh;
+                    immediates.currentPnMtx = (i * 37u) % kMatrixCount;
+                    encoderPass.SetImmediates(0, &immediates, sizeof(immediates));
+                    encoderPass.Draw(kVerticesPerMesh);
+                } else {
+                    // Same meshes, positioned through the draw's first vertex instead.
+                    encoderPass.Draw(kVerticesPerMesh, 1, i * kVerticesPerMesh);
+                }
             }
         }
         encoderPass.End();
@@ -737,9 +755,12 @@ bool Benchmark::RenderFrame(const wgpu::RenderPipeline &drawPipeline, Efb &efb, 
     }
 
     const wgpu::CommandBuffer commands = encoder.Finish();
+    lap(&FrameTimings::record);
     queue.Submit(1, &commands);
+    lap(&FrameTimings::submit);
     context_->Present();
     context_->ProcessEvents();
+    lap(&FrameTimings::present);
     lastEfb_ = &efb;
     return true;
 }
@@ -748,7 +769,7 @@ void Benchmark::ShowOverlay(const TextImage &overlay)
 {
     UploadOverlay(overlay);
     Efb &efb = lastEfb_ ? *lastEfb_ : GetEfb(context_->Width(), context_->Height());
-    RenderFrame(drawPipeline_, efb, 0);
+    RenderFrame(drawPipeline_, efb, FrameWork{});
 }
 
 void Benchmark::RunShaderCompileTest(Report &report)
@@ -761,7 +782,7 @@ void Benchmark::RunShaderCompileTest(Report &report)
         const double start                  = NowMs();
         const wgpu::RenderPipeline pipeline = CreateDrawPipeline(0.001f * static_cast<float>(i + 1));
         // Draw once so any compile the driver deferred to first use is counted too.
-        RenderFrame(pipeline, efb, 1);
+        RenderFrame(pipeline, efb, FrameWork{ 1, 1, true });
         context_->WaitForIdle();
         times.push_back(NowMs() - start);
     }
@@ -784,14 +805,16 @@ void Benchmark::RunScenario(const Scenario &scenario, Report &report, const Text
     UploadOverlay(overlay);
     Efb &efb = GetEfb(scenario.efbWidth, scenario.efbHeight);
 
+    const FrameWork work = { scenario.drawCount, scenario.uploadDraws, scenario.perDrawImmediates };
     for (int i = 0; i < kWarmupFrames; ++i)
-        RenderFrame(drawPipeline_, efb, scenario.drawCount);
+        RenderFrame(drawPipeline_, efb, work);
     context_->WaitForIdle();
 
+    FrameTimings timings;
     const double start = NowMs();
     int presented      = 0;
     for (int i = 0; i < kMeasuredFrames; ++i) {
-        if (RenderFrame(drawPipeline_, efb, scenario.drawCount))
+        if (RenderFrame(drawPipeline_, efb, work, &timings))
             ++presented;
         // Keep the TV's input queue drained so the app stays responsive.
         SDL_PumpEvents();
@@ -814,6 +837,13 @@ void Benchmark::RunScenario(const Scenario &scenario, Report &report, const Text
     char fps[32];
     std::snprintf(fps, sizeof(fps), " (%.0f fps)", 1000.0 / frameMs);
     report.Add(status, scenario.name, FormatMs(frameMs) + " per frame" + fps);
+
+    // Where the CPU time went, per frame (short enough for the screen's value column).
+    char split[64];
+    std::snprintf(split, sizeof(split), "up %.0f rec %.0f sub %.0f pres %.0f ms",
+                  timings.upload / kMeasuredFrames, timings.record / kMeasuredFrames,
+                  timings.submit / kMeasuredFrames, timings.present / kMeasuredFrames);
+    report.Add(Status::Info, "  | time split", split);
 }
 
 } // namespace probe

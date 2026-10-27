@@ -101,11 +101,14 @@ KeyAction PollActions()
 std::vector<probe::Scenario> Scenarios(std::uint32_t screenWidth, std::uint32_t screenHeight)
 {
     return {
-        { "300 draws, screen res", 300, screenWidth, screenHeight },
-        { "1000 draws, screen res", 1000, screenWidth, screenHeight },
-        { "2500 draws, screen res", 2500, screenWidth, screenHeight },
-        { "1000 draws, 1280x720", 1000, 1280, 720 },
-        { "1000 draws, 640x528 (GC)", 1000, 640, 528 },
+        { "300 draws, screen res", 300, 300, true, screenWidth, screenHeight },
+        { "1000 draws, screen res", 1000, 1000, true, screenWidth, screenHeight },
+        // The split tests run at the GameCube's resolution, where pixel work is small,
+        // to separate the per-draw cost from the cost of streaming vertex data.
+        { "1000 draws, GC res", 1000, 1000, true, 640, 528 },
+        { "  no vertex upload", 1000, 0, true, 640, 528 },
+        { "  no upload, no immediates", 1000, 0, false, 640, 528 },
+        { "  upload only (no draws)", 0, 1000, true, 640, 528 },
     };
 }
 
