@@ -30,6 +30,22 @@ Each result is marked PASS, WARN or FAIL. The report is also written to
 
 Keys: **OK** runs the benchmarks again, **Back** quits.
 
+## Results (LG webOS 6, Mali-G51, driver r9p0, probe 0.3.0)
+
+- Dawn's OpenGL ES backend starts and presents on webOS (with the patches in
+  `patches/`).
+- **The driver allows no storage buffers in the vertex stage**, which Aurora
+  requires; vertex data would have to come from textures (an Aurora patch).
+- With that workaround, 1000 GX-style draws take about 72 ms per frame
+  (30 fps needs 33 ms), at any resolution. Split per frame: about 50 ms in
+  `Queue::Submit` (Dawn's GL backend making the GL calls, about 47 µs per
+  draw), about 15 ms streaming vertex data, 5 ms of it from per-draw
+  immediates; recording commands is about 1 ms.
+- 300 draws run at 29 ms. A pipeline compiles in about 120 ms.
+
+So the cost is in issuing GL draws on the TV's CPU, not in the GPU's pixel
+work: Aurora through Dawn fits only scenes of a few hundred draws.
+
 ## Building
 
 You need Linux x86_64 (or a Linux VM/container on macOS), the webosbrew
