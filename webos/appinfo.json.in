@@ -1,0 +1,15 @@
+{
+    "id": "@PROBE_APP_ID@",
+    "version": "@PROJECT_VERSION@",
+    "vendor": "WebGPU webOS probe",
+    "type": "native",
+    "main": "bin/wgpuprobe",
+    "title": "WebGPU Probe",
+    "icon": "icon.png",
+    "largeIcon": "largeIcon.png",
+    "iconColor": "#0a1026",
+    "appDescription": "Checks whether the TV can run a WebGPU (Dawn) game renderer.",
+    "supportTouchMode": "none",
+    "useAllMouseButtons": false,
+    "requiredACG": []
+}

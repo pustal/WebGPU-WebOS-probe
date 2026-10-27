@@ -1,0 +1,20 @@
+diff --git a/src/dawn/common/AlignedAlloc.cpp b/src/dawn/common/AlignedAlloc.cpp
+index 7bbadce39..85a23005d 100644
+--- a/src/dawn/common/AlignedAlloc.cpp
++++ b/src/dawn/common/AlignedAlloc.cpp
+@@ -50,7 +50,14 @@ void* AlignedAlloc(size_t size, size_t alignment) {
+     return memalign(alignment, size);
+ 
+ #else
+-    return aligned_alloc(alignment, size);
++    // posix_memalign rather than aligned_alloc: older C libraries (glibc before 2.16, as on
++    // LG webOS TVs) do not have aligned_alloc. The result is also released with free().
++    void* result = nullptr;
++    const size_t posixAlignment = alignment < sizeof(void*) ? sizeof(void*) : alignment;
++    if (posix_memalign(&result, posixAlignment, size) != 0) {
++        return nullptr;
++    }
++    return result;
+ 
+ #endif
+ }

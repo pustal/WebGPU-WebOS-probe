@@ -1,0 +1,162 @@
+diff --git a/src/dawn/native/opengl/SwapChainEGL.cpp b/src/dawn/native/opengl/SwapChainEGL.cpp
+index 767a91db5..371b9ef70 100644
+--- a/src/dawn/native/opengl/SwapChainEGL.cpp
++++ b/src/dawn/native/opengl/SwapChainEGL.cpp
+@@ -29,6 +29,10 @@
+ 
+ #include <utility>
+ 
++#if defined(DAWN_USE_WAYLAND)
++#include <dlfcn.h>
++#endif
++
+ #include "src/dawn/native/Surface.h"
+ #include "src/dawn/native/opengl/ContextEGL.h"
+ #include "src/dawn/native/opengl/DeviceGL.h"
+@@ -40,6 +44,44 @@
+ 
+ namespace dawn::native::opengl {
+ 
++#if defined(DAWN_USE_WAYLAND)
++namespace {
++
++// libwayland-egl entry points, loaded at run time so Dawn does not link against Wayland.
++struct WaylandEGLFunctions {
++    void* (*windowCreate)(void* surface, int width, int height) = nullptr;
++    void (*windowDestroy)(void* window) = nullptr;
++    void (*windowResize)(void* window, int width, int height, int dx, int dy) = nullptr;
++};
++
++// Returns the loaded functions, or nullptr if libwayland-egl is unavailable.
++const WaylandEGLFunctions* GetWaylandEGLFunctions() {
++    static const WaylandEGLFunctions* functions = []() -> const WaylandEGLFunctions* {
++        void* lib = dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_LOCAL);
++        if (lib == nullptr) {
++            lib = dlopen("libwayland-egl.so", RTLD_NOW | RTLD_LOCAL);
++        }
++        if (lib == nullptr) {
++            return nullptr;
++        }
++        static WaylandEGLFunctions loaded;
++        loaded.windowCreate = reinterpret_cast<decltype(loaded.windowCreate)>(
++            dlsym(lib, "wl_egl_window_create"));
++        loaded.windowDestroy = reinterpret_cast<decltype(loaded.windowDestroy)>(
++            dlsym(lib, "wl_egl_window_destroy"));
++        loaded.windowResize = reinterpret_cast<decltype(loaded.windowResize)>(
++            dlsym(lib, "wl_egl_window_resize"));
++        if (!loaded.windowCreate || !loaded.windowDestroy || !loaded.windowResize) {
++            return nullptr;
++        }
++        return &loaded;
++    }();
++    return functions;
++}
++
++}  // namespace
++#endif  // defined(DAWN_USE_WAYLAND)
++
+ // static
+ ResultOrError<Ref<SwapChainEGL>> SwapChainEGL::Create(Device* device,
+                                                       Surface* surface,
+@@ -79,6 +121,7 @@ MaybeError SwapChainEGL::Initialize(SwapChainBase* previousSwapChain) {
+             SwapChainEGL* previousEGLSwapChain =
+                 reinterpret_cast<SwapChainEGL*>(ToBackend(previousSwapChain));
+             std::swap(previousEGLSwapChain->mEGLSurface, mEGLSurface);
++            std::swap(previousEGLSwapChain->mWaylandEGLWindow, mWaylandEGLWindow);
+         }
+ 
+         previousSwapChain->DetachFromSurface();
+@@ -90,6 +133,14 @@ MaybeError SwapChainEGL::Initialize(SwapChainBase* previousSwapChain) {
+     if (mEGLSurface == EGL_NO_SURFACE) {
+         DAWN_TRY(CreateEGLSurface(display));
+     }
++#if defined(DAWN_USE_WAYLAND)
++    else if (mWaylandEGLWindow != nullptr) {
++        // A reused Wayland surface takes its buffer size from the wl_egl_window, not from the
++        // compositor, so it has to follow the new configuration.
++        GetWaylandEGLFunctions()->windowResize(mWaylandEGLWindow, static_cast<int>(GetWidth()),
++                                               static_cast<int>(GetHeight()), 0, 0);
++    }
++#endif
+ 
+     EGLint swapInterval = GetPresentMode() == wgpu::PresentMode::Immediate ? 0 : 1;
+     display->egl->SwapInterval(display->GetDisplay(), swapInterval);
+@@ -164,6 +215,7 @@ void SwapChainEGL::DetachFromSurfaceImpl() {
+         device->GetEGL(false).DestroySurface(device->GetEGLDisplay(), mEGLSurface);
+         mEGLSurface = EGL_NO_SURFACE;
+     }
++    DestroyWaylandEGLWindow();
+ 
+     if (mTexture != nullptr) {
+         mTexture->APIDestroy();
+@@ -172,6 +224,15 @@ void SwapChainEGL::DetachFromSurfaceImpl() {
+     }
+ }
+ 
++void SwapChainEGL::DestroyWaylandEGLWindow() {
++#if defined(DAWN_USE_WAYLAND)
++    if (mWaylandEGLWindow != nullptr) {
++        GetWaylandEGLFunctions()->windowDestroy(mWaylandEGLWindow);
++        mWaylandEGLWindow = nullptr;
++    }
++#endif
++}
++
+ MaybeError SwapChainEGL::CreateEGLSurface(const DisplayEGL* display) {
+     DAWN_ASSERT(mEGLSurface == EGL_NO_SURFACE);
+ 
+@@ -229,9 +290,36 @@ MaybeError SwapChainEGL::CreateEGLSurface(const DisplayEGL* display) {
+                 return {};
+ #endif  // defined(DAWN_USE_X11)
+ 
++#if defined(DAWN_USE_WAYLAND)
++            case Surface::Type::WaylandSurface: {
++                // The EGLDisplay must have been created from the same wl_display (pass it with
++                // RequestAdapterOptionsGetGLProc), otherwise the driver rejects the window.
++                const WaylandEGLFunctions* wl = GetWaylandEGLFunctions();
++                if (wl == nullptr) {
++                    return DAWN_FORMAT_INTERNAL_ERROR("libwayland-egl is not available for %s.",
++                                                      surface);
++                }
++                DAWN_ASSERT(mWaylandEGLWindow == nullptr);
++                mWaylandEGLWindow =
++                    wl->windowCreate(surface->GetWaylandSurface(), static_cast<int>(GetWidth()),
++                                     static_cast<int>(GetHeight()));
++                if (mWaylandEGLWindow == nullptr) {
++                    return DAWN_FORMAT_INTERNAL_ERROR("wl_egl_window_create failed for %s.",
++                                                      surface);
++                }
++                mEGLSurface = egl.CreateWindowSurface(
++                    eglDisplay, config,
++                    (EGLNativeWindowType)(reinterpret_cast<uintptr_t>(mWaylandEGLWindow)),
++                    attribs.data());
++                if (mEGLSurface == EGL_NO_SURFACE) {
++                    DestroyWaylandEGLWindow();
++                }
++                return {};
++            }
++#endif  // defined(DAWN_USE_WAYLAND)
++
+             // TODO(344814083): Add support for creating surfaces using EGL_KHR_platform_base and
+             // friends.
+-            case Surface::Type::WaylandSurface:
+ 
+             default:
+                 return DAWN_FORMAT_INTERNAL_ERROR("%s cannot be supported on EGL.", surface);
+diff --git a/src/dawn/native/opengl/SwapChainEGL.h b/src/dawn/native/opengl/SwapChainEGL.h
+index a3b236ab4..be7b77d99 100644
+--- a/src/dawn/native/opengl/SwapChainEGL.h
++++ b/src/dawn/native/opengl/SwapChainEGL.h
+@@ -53,8 +53,12 @@ class SwapChainEGL final : public SwapChainBase {
+     MaybeError Initialize(SwapChainBase* previousSwapChain);
+ 
+     MaybeError CreateEGLSurface(const DisplayEGL* display);
++    void DestroyWaylandEGLWindow();
+ 
+     EGLSurface mEGLSurface = EGL_NO_SURFACE;
++    // Wayland only: the wl_egl_window wrapping the surface's wl_surface. It owns the size of
++    // the EGL surface's buffers, so it is resized whenever the swap chain is reconfigured.
++    void* mWaylandEGLWindow = nullptr;
+     Ref<Texture> mTexture;
+     Ref<TextureView> mTextureView;
+ 
