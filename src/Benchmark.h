@@ -4,7 +4,8 @@
  *        a shader compile test and a frame-time benchmark.
  *
  * The draw shader follows Aurora's generated GX shader (extern/aurora/lib/gx/
- * shader.cpp): vertices are read from storage buffers with byte-level
+ * shader.cpp): vertices are read from storage buffers (or, where the vertex
+ * stage has none, from r32uint textures) with byte-level
  * unpacking, per-draw data comes in as immediates, the fragment stage samples
  * two textures and runs three TEV stages with Aurora's 8-bit overflow
  * emulation, alpha test and fog. Each frame:
@@ -74,6 +75,10 @@ private:
     wgpu::RenderPipeline CreateDrawPipeline(float variant);
     wgpu::RenderPipeline CreateBlitPipeline(wgpu::TextureFormat format, bool blend);
     wgpu::Texture CreatePatternTexture(std::uint32_t size, std::uint32_t seed);
+    /** r32uint texture of @p rows rows of vertex data (texture mode only). */
+    wgpu::Texture CreateDataTexture(std::uint32_t rows);
+    /** Uploads the first @p rows full rows of @p words into @p texture. */
+    void WriteDataTexture(const wgpu::Texture &texture, const std::uint32_t *words, std::uint32_t rows);
     Efb &GetEfb(std::uint32_t width, std::uint32_t height);
     void UploadOverlay(const TextImage &overlay);
 
@@ -90,6 +95,10 @@ private:
     wgpu::PipelineLayout drawLayout_;
     wgpu::PipelineLayout blitPipelineLayout_;
 
+    /** Vertex data in textures instead of storage buffers (see GpuContext::VertexStorageBuffers). */
+    bool useTextures_ = false;
+    wgpu::Texture vertexTexture_;
+    wgpu::Texture matrixTexture_;
     wgpu::Buffer vertexBuffer_;
     wgpu::Buffer matrixBuffer_;
     wgpu::Buffer uniformBuffer_;

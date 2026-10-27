@@ -20,6 +20,11 @@ expose 3.2).
 | Shaders | Time to compile a pipeline shaped like Aurora's generated GX shaders (WGSL, translated to GLSL ES by Dawn, then compiled by the TV's driver) |
 | Frame time | Frames with 300 to 2500 draws in that shader style. Each frame streams its vertex data, draws into an off-screen EFB, makes an EFB copy and draws it back, then scales to the screen. Luigi's Mansion runs at 30 fps (33.3 ms per frame) |
 
+If the vertex stage cannot read storage buffers (the webOS 6 Mali-G51 driver
+reports 0, which Aurora does not support), the probe says so and runs the
+benchmarks with vertex data in `r32uint` textures instead: the change a webOS
+build of Aurora would need.
+
 Each result is marked PASS, WARN or FAIL. The report is also written to
 `webgpu-probe-report.txt` in the app's home folder.
 

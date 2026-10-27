@@ -56,6 +56,13 @@ public:
     std::uint32_t Width() const { return width_; }
     std::uint32_t Height() const { return height_; }
 
+    /**
+     * True if the vertex stage can read storage buffers, as Aurora requires.
+     * When false the device is created without them and the benchmark reads
+     * vertex data from textures instead (the workaround a patched Aurora would use).
+     */
+    bool VertexStorageBuffers() const { return vertexStorageBuffers_; }
+
     /** True while an uncaptured device error has been seen (the last message is kept). */
     bool HadDeviceError() const { return !lastDeviceError_.empty(); }
     const std::string &LastDeviceError() const { return lastDeviceError_; }
@@ -76,6 +83,7 @@ private:
     wgpu::TextureFormat surfaceFormat_ = wgpu::TextureFormat::Undefined;
     std::uint32_t width_  = 0;
     std::uint32_t height_ = 0;
+    bool vertexStorageBuffers_ = false;
 
     void *wlDisplay_  = nullptr; ///< struct wl_display *, owned by SDL
     void *wlSurface_  = nullptr; ///< struct wl_surface *, owned by SDL

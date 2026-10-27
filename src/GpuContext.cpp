@@ -216,6 +216,7 @@ void GpuContext::ReportAdapter(Report &report)
     limits.nextInChain = &compat;
     adapter_.GetLimits(&limits);
 
+    vertexStorageBuffers_ = compat.maxStorageBuffersInVertexStage >= kAuroraStorageBuffersPerStage;
     const bool storageOk = compat.maxStorageBuffersInVertexStage >= kAuroraStorageBuffersPerStage &&
                            compat.maxStorageBuffersInFragmentStage >= kAuroraStorageBuffersPerStage &&
                            limits.maxStorageBuffersPerShaderStage >= kAuroraStorageBuffersPerStage;
@@ -248,9 +249,10 @@ bool GpuContext::RequestDevice(Report &report)
     wgpu::Limits supported;
     adapter_.GetLimits(&supported);
 
-    // Aurora's required limits (see the constants above).
+    // Aurora's required limits (see the constants above). Without vertex-stage storage
+    // buffers, ask for none there: the benchmark then reads vertex data from textures.
     wgpu::CompatibilityModeLimits compat;
-    compat.maxStorageBuffersInVertexStage   = kAuroraStorageBuffersPerStage;
+    compat.maxStorageBuffersInVertexStage   = vertexStorageBuffers_ ? kAuroraStorageBuffersPerStage : 0;
     compat.maxStorageBuffersInFragmentStage = kAuroraStorageBuffersPerStage;
     wgpu::Limits required;
     required.nextInChain                     = &compat;
@@ -303,7 +305,11 @@ bool GpuContext::RequestDevice(Report &report)
         return false;
     }
     queue_ = device_.GetQueue();
-    report.Add(Status::Pass, "Device", "created with Aurora's limits and toggles");
+    if (vertexStorageBuffers_)
+        report.Add(Status::Pass, "Device", "created with Aurora's limits and toggles");
+    else
+        report.Add(Status::Warn, "Device",
+                   "created without vertex storage buffers: vertex data comes from textures (needs an Aurora patch)");
     return true;
 }
 

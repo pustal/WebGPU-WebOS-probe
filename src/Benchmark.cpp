@@ -31,6 +31,8 @@ constexpr std::uint32_t kImmediateSize     = 64;  ///< Aurora's DrawImmediateDat
 constexpr std::uint32_t kEfbCopyWidth      = 640; ///< GameCube EFB copy size
 constexpr std::uint32_t kEfbCopyHeight     = 480;
 constexpr std::uint32_t kPatternSize       = 256;
+/** Row width (in u32 words) of the vertex-data textures used without vertex storage buffers. */
+constexpr std::uint32_t kDataTextureWidth  = 4096;
 constexpr int kWarmupFrames                = 10;
 constexpr int kMeasuredFrames              = 120;
 constexpr wgpu::TextureFormat kEfbFormat   = wgpu::TextureFormat::RGBA8Unorm;
@@ -80,8 +82,7 @@ struct Uniform {
     fog_color: vec4f,
     fog_params: vec4f,
 };
-@group(0) @binding(0) var<storage, read> vbuf: array<u32>;
-@group(0) @binding(1) var<storage, read> abuf: array<u32>;
+{VERTEX_DATA}
 @group(1) @binding(0) var<uniform> ubuf: Uniform;
 @group(2) @binding(0) var tex0: texture_2d<f32>;
 @group(2) @binding(1) var tex1: texture_2d<f32>;
@@ -89,10 +90,10 @@ struct Uniform {
 
 const VARIANT: f32 = {VARIANT};
 
-fn vbuf_f32(byte_off: u32) -> f32 { return bitcast<f32>(vbuf[byte_off >> 2u]); }
-fn abuf_f32(byte_off: u32) -> f32 { return bitcast<f32>(abuf[byte_off >> 2u]); }
+fn vbuf_f32(byte_off: u32) -> f32 { return bitcast<f32>(vbuf_word(byte_off >> 2u)); }
+fn abuf_f32(byte_off: u32) -> f32 { return bitcast<f32>(abuf_word(byte_off >> 2u)); }
 fn vbuf_u8_4(byte_off: u32) -> vec4u {
-    let v = vbuf[byte_off >> 2u];
+    let v = vbuf_word(byte_off >> 2u);
     return vec4u(v & 0xFFu, (v >> 8u) & 0xFFu, (v >> 16u) & 0xFFu, v >> 24u);
 }
 fn tev_overflow_vec4f(in: vec4f) -> vec4f {
@@ -145,6 +146,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let fog = clamp((in.fog_z - ubuf.fog_params.x) * ubuf.fog_params.y, 0.0, 1.0);
     return vec4f(mix(prev.rgb, ubuf.fog_color.rgb, fog), prev.a);
 }
+)";
+
+/** Vertex data as storage buffers: what Aurora does. */
+constexpr const char *kVertexDataFromStorage = R"(
+@group(0) @binding(0) var<storage, read> vbuf: array<u32>;
+@group(0) @binding(1) var<storage, read> abuf: array<u32>;
+fn vbuf_word(i: u32) -> u32 { return vbuf[i]; }
+fn abuf_word(i: u32) -> u32 { return abuf[i]; }
+)";
+
+/**
+ * Vertex data as r32uint textures, 4096 words per row: the workaround for GPUs
+ * whose vertex stage cannot read storage buffers (Mali on webOS reports 0).
+ */
+constexpr const char *kVertexDataFromTextures = R"(
+@group(0) @binding(0) var vtex: texture_2d<u32>;
+@group(0) @binding(1) var atex: texture_2d<u32>;
+fn vbuf_word(i: u32) -> u32 { return textureLoad(vtex, vec2u(i & 4095u, i >> 12u), 0).x; }
+fn abuf_word(i: u32) -> u32 { return textureLoad(atex, vec2u(i & 4095u, i >> 12u), 0).x; }
 )";
 
 /** Full-screen triangle that copies a texture (used for the EFB copy, the scale-out and the overlay). */
@@ -255,6 +275,9 @@ wgpu::RenderPipeline Benchmark::CreateDrawPipeline(float variant)
     std::snprintf(literal, sizeof(literal), "%.6f", static_cast<double>(variant));
     const std::string placeholder = "{VARIANT}";
     wgsl.replace(wgsl.find(placeholder), placeholder.size(), literal);
+    const std::string dataPlaceholder = "{VERTEX_DATA}";
+    wgsl.replace(wgsl.find(dataPlaceholder), dataPlaceholder.size(),
+                 useTextures_ ? kVertexDataFromTextures : kVertexDataFromStorage);
     const wgpu::ShaderModule module = CreateShader(wgsl);
 
     wgpu::BlendState blend;
@@ -313,15 +336,19 @@ wgpu::RenderPipeline Benchmark::CreateBlitPipeline(wgpu::TextureFormat format, b
 
 bool Benchmark::Initialize(GpuContext &context, Report &report)
 {
-    context_ = &context;
-    device_  = context.Device();
+    context_     = &context;
+    device_      = context.Device();
+    useTextures_ = !context.VertexStorageBuffers();
 
     // ---- Layouts, as Aurora binds them: storage (vertex data), uniforms, textures ----
     std::array<wgpu::BindGroupLayoutEntry, 2> storageEntries;
     for (std::uint32_t i = 0; i < storageEntries.size(); ++i) {
         storageEntries[i].binding     = i;
         storageEntries[i].visibility  = wgpu::ShaderStage::Vertex;
-        storageEntries[i].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+        if (useTextures_)
+            storageEntries[i].texture.sampleType = wgpu::TextureSampleType::Uint;
+        else
+            storageEntries[i].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
     }
     wgpu::BindGroupLayoutDescriptor storageDescriptor;
     storageDescriptor.entryCount = storageEntries.size();
@@ -375,7 +402,9 @@ bool Benchmark::Initialize(GpuContext &context, Report &report)
     blitPipelineLayout_                       = device_.CreatePipelineLayout(&blitLayoutDescriptor);
 
     // ---- Geometry: one small 4 x 6 quad grid per draw, each with its own vertices ----
-    vertexWords_.resize(static_cast<std::size_t>(kMaxDraws) * kVerticesPerMesh * kWordsPerVertex);
+    const std::size_t vertexWordCount = static_cast<std::size_t>(kMaxDraws) * kVerticesPerMesh * kWordsPerVertex;
+    // Whole texture rows, so every upload in texture mode is a full-row copy.
+    vertexWords_.resize((vertexWordCount + kDataTextureWidth - 1) / kDataTextureWidth * kDataTextureWidth);
     std::size_t word = 0;
     for (std::uint32_t mesh = 0; mesh < kMaxDraws; ++mesh) {
         const float z = 0.1f + 0.8f * static_cast<float>(mesh % 97) / 97.0f;
@@ -397,10 +426,10 @@ bool Benchmark::Initialize(GpuContext &context, Report &report)
             }
         }
     }
-    vertexBuffer_ = CreateBuffer(device_, vertexWords_.size() * 4, wgpu::BufferUsage::Storage);
 
     // Position matrices: translations spread over the screen.
-    std::vector<std::uint32_t> matrices(static_cast<std::size_t>(kMatrixCount) * kWordsPerMatrix);
+    std::vector<std::uint32_t> matrices(kDataTextureWidth); // one texture row; 256 matrices use 3072 words
+    static_assert(kMatrixCount * kWordsPerMatrix <= kDataTextureWidth, "matrices must fit one row");
     for (std::uint32_t m = 0; m < kMatrixCount; ++m) {
         const float tx = -0.95f + 1.85f * static_cast<float>(m % 16) / 15.0f;
         const float ty = -0.95f + 1.85f * static_cast<float>(m / 16) / 15.0f;
@@ -412,8 +441,15 @@ bool Benchmark::Initialize(GpuContext &context, Report &report)
         for (std::uint32_t i = 0; i < kWordsPerMatrix; ++i)
             matrices[static_cast<std::size_t>(m) * kWordsPerMatrix + i] = FloatBits(rows[i]);
     }
-    matrixBuffer_ = CreateBuffer(device_, matrices.size() * 4, wgpu::BufferUsage::Storage);
-    context.Queue().WriteBuffer(matrixBuffer_, 0, matrices.data(), matrices.size() * 4);
+    if (useTextures_) {
+        vertexTexture_ = CreateDataTexture(static_cast<std::uint32_t>(vertexWords_.size() / kDataTextureWidth));
+        matrixTexture_ = CreateDataTexture(1);
+        WriteDataTexture(matrixTexture_, matrices.data(), 1);
+    } else {
+        vertexBuffer_ = CreateBuffer(device_, vertexWords_.size() * 4, wgpu::BufferUsage::Storage);
+        matrixBuffer_ = CreateBuffer(device_, matrices.size() * 4, wgpu::BufferUsage::Storage);
+        context.Queue().WriteBuffer(matrixBuffer_, 0, matrices.data(), matrices.size() * 4);
+    }
 
     const DrawUniforms uniforms = {
         { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 },
@@ -434,9 +470,14 @@ bool Benchmark::Initialize(GpuContext &context, Report &report)
     // ---- Bind groups ----
     std::array<wgpu::BindGroupEntry, 2> storageBindings;
     storageBindings[0].binding = 0;
-    storageBindings[0].buffer  = vertexBuffer_;
     storageBindings[1].binding = 1;
-    storageBindings[1].buffer  = matrixBuffer_;
+    if (useTextures_) {
+        storageBindings[0].textureView = DefaultView(vertexTexture_);
+        storageBindings[1].textureView = DefaultView(matrixTexture_);
+    } else {
+        storageBindings[0].buffer = vertexBuffer_;
+        storageBindings[1].buffer = matrixBuffer_;
+    }
     wgpu::BindGroupDescriptor storageGroupDescriptor;
     storageGroupDescriptor.layout     = storageLayout_;
     storageGroupDescriptor.entryCount = storageBindings.size();
@@ -499,8 +540,30 @@ bool Benchmark::Initialize(GpuContext &context, Report &report)
         report.Add(Status::Fail, "Resources", context.LastDeviceError());
         return false;
     }
-    report.Add(Status::Pass, "Resources", "storage-buffer vertex pulling, immediates, EFB copy");
+    report.Add(Status::Pass, "Resources",
+               std::string(useTextures_ ? "texture" : "storage-buffer") + " vertex pulling, immediates, EFB copy");
     return true;
+}
+
+wgpu::Texture Benchmark::CreateDataTexture(std::uint32_t rows)
+{
+    wgpu::TextureDescriptor descriptor;
+    descriptor.size   = { kDataTextureWidth, rows, 1 };
+    descriptor.format = wgpu::TextureFormat::R32Uint;
+    descriptor.usage  = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+    return device_.CreateTexture(&descriptor);
+}
+
+void Benchmark::WriteDataTexture(const wgpu::Texture &texture, const std::uint32_t *words, std::uint32_t rows)
+{
+    wgpu::TexelCopyTextureInfo destination;
+    destination.texture = texture;
+    wgpu::TexelCopyBufferLayout layout;
+    layout.bytesPerRow          = kDataTextureWidth * 4;
+    layout.rowsPerImage         = rows;
+    const wgpu::Extent3D extent = { kDataTextureWidth, rows, 1 };
+    context_->Queue().WriteTexture(&destination, words, static_cast<std::size_t>(rows) * kDataTextureWidth * 4,
+                                   &layout, &extent);
 }
 
 Benchmark::Efb &Benchmark::GetEfb(std::uint32_t width, std::uint32_t height)
@@ -580,7 +643,12 @@ bool Benchmark::RenderFrame(const wgpu::RenderPipeline &drawPipeline, Efb &efb, 
     // 1. Stream this frame's vertices, as Aurora does with the game's vertex data.
     if (drawCount > 0) {
         const std::size_t bytes = static_cast<std::size_t>(drawCount) * kVerticesPerMesh * kBytesPerVertex;
-        queue.WriteBuffer(vertexBuffer_, 0, vertexWords_.data(), bytes);
+        if (useTextures_) {
+            const std::size_t rowBytes = static_cast<std::size_t>(kDataTextureWidth) * 4;
+            WriteDataTexture(vertexTexture_, vertexWords_.data(), static_cast<std::uint32_t>((bytes + rowBytes - 1) / rowBytes));
+        } else {
+            queue.WriteBuffer(vertexBuffer_, 0, vertexWords_.data(), bytes);
+        }
     }
 
     const wgpu::CommandEncoder encoder = device_.CreateCommandEncoder();
